@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ATC Quiz - Join</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="player-page">
+  <div class="app-shell player-shell">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/atc-logo.jpg.jpeg" alt="Advanced Tech Club">
+        <div>
+          <span>Advanced Tech Club</span>
+          <small>Player</small>
+        </div>
+      </div>
+      <div class="status-chip" id="playerPhase">Join</div>
+    </header>
+
+    <main class="player-main">
+      <section id="joinPanel" class="panel player-card">
+        <span class="eyebrow">Code in Air Quiz</span>
+        <h1>Join the quiz</h1>
+        <p class="muted">Enter your name before the host starts.</p>
+        <input id="name" maxlength="28" placeholder="Your name" autocomplete="name">
+        <button class="btn full" id="joinBtn">Join Quiz</button>
+        <p id="err" class="error-text"></p>
+      </section>
+
+      <section id="waitPanel" class="panel player-card is-hidden">
+        <div class="player-avatar" id="waitAvatar"></div>
+        <h1 id="waitTitle">You are in</h1>
+        <p class="muted" id="waitText">Wait for the host to begin.</p>
+        <div class="player-score">
+          <span>Score</span>
+          <strong id="waitScore">0 p</strong>
+        </div>
+      </section>
+
+      <section id="countdownPanel" class="panel player-card is-hidden">
+        <span class="eyebrow" id="countdownLabel">Next question</span>
+        <div class="countdown-number" id="countdownNumber">5</div>
+        <p class="muted">Get ready</p>
+      </section>
+
+      <section id="quizPanel" class="panel player-card wide-card is-hidden">
+        <div class="question-header">
+          <div>
+            <span class="eyebrow" id="playerQuestionLabel">Question</span>
+            <h1 id="questionText"></h1>
+          </div>
+          <div class="timer" id="playerTimer">15</div>
+        </div>
+        <div class="progress"><div id="playerProgress"></div></div>
+        <div class="option-grid" id="options"></div>
+        <p id="message" class="muted center"></p>
+      </section>
+
+      <section id="resultPanel" class="panel player-card is-hidden">
+        <div class="player-avatar" id="resultAvatar"></div>
+        <h1 id="resultTitle">Answer saved</h1>
+        <p id="resultText" class="muted"></p>
+        <div class="player-score">
+          <span>Your score</span>
+          <strong id="resultScore">0 p</strong>
+        </div>
+      </section>
+
+      <section id="donePanel" class="panel player-card is-hidden">
+        <div class="player-avatar" id="doneAvatar"></div>
+        <h1>Quiz complete</h1>
+        <p class="muted">Watch the host screen for the final leaderboard.</p>
+        <div class="player-score">
+          <span>Final score</span>
+          <strong id="doneScore">0 p</strong>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const $ = id => document.getElementById(id);
+    const letters = ["A", "B", "C", "D"];
+    let me = null;
+    let currentQuestion = null;
+    let selectedAnswer = null;
+    let playerTimer = null;
+
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, match => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[match]));
+    }
+
+    function panel(id) {
+      ["joinPanel", "waitPanel", "countdownPanel", "quizPanel", "resultPanel", "donePanel"]
+        .forEach(panelId => $(panelId).classList.toggle("is-hidden", panelId !== id));
+    }
+
+    function updatePlayerBadge() {
+      if (!me) return;
+      $("waitAvatar").textContent = me.avatar || "";
+      $("resultAvatar").textContent = me.avatar || "";
+      $("doneAvatar").textContent = me.avatar || "";
+      $("waitTitle").textContent = `${me.avatar || ""} ${me.name}`;
+      $("waitScore").textContent = `${me.score || 0} p`;
+      $("resultScore").textContent = `${me.score || 0} p`;
+      $("doneScore").textContent = `${me.score || 0} p`;
+    }
+
+    function syncMeFromLeaderboard(list) {
+      if (!me || !Array.isArray(list)) return;
+      const row = list.find(player => player.name === me.name);
+      if (!row) return;
+      me = { ...me, ...row };
+      updatePlayerBadge();
+    }
+
+    function showWait(text) {
+      clearPlayerTimer();
+      currentQuestion = null;
+      selectedAnswer = null;
+      $("playerPhase").textContent = "Waiting";
+      $("waitText").textContent = text || "Wait for the host to begin.";
+      updatePlayerBadge();
+      panel("waitPanel");
+    }
+
+    function showCountdown(data) {
+      clearPlayerTimer();
+      currentQuestion = null;
+      selectedAnswer = null;
+      $("playerPhase").textContent = "Countdown";
+      $("countdownLabel").textContent = `Question ${data.nextQuestion + 1}`;
+      $("countdownNumber").textContent = data.value;
+      panel("countdownPanel");
+    }
+
+    function showQuestion(payload) {
+      clearPlayerTimer();
+      currentQuestion = payload.question;
+      selectedAnswer = null;
+      if (!currentQuestion) return;
+
+      $("playerPhase").textContent = "Question live";
+      $("playerQuestionLabel").textContent = `Question ${currentQuestion.index + 1} of ${payload.total}`;
+      $("questionText").textContent = currentQuestion.q;
+      $("playerProgress").style.width = `${((currentQuestion.index + 1) / payload.total) * 100}%`;
+      $("message").textContent = "Choose one answer.";
+      $("options").innerHTML = currentQuestion.options.map((option, index) => `
+        <button class="answer-tile choice" data-answer="${index}">
+          <span class="letter">${letters[index]}</span>
+          <span>${escapeHtml(option)}</span>
+        </button>
+      `).join("");
+
+      document.querySelectorAll(".choice").forEach(button => {
+        button.onclick = () => submitAnswer(button);
+      });
+
+      startPlayerTimer(payload.durationMs || payload.fullDurationMs || 15000);
+      panel("quizPanel");
+    }
+
+    function submitAnswer(button) {
+      if (!currentQuestion || selectedAnswer !== null) return;
+
+      selectedAnswer = Number(button.dataset.answer);
+      document.querySelectorAll(".choice").forEach(choice => choice.disabled = true);
+      button.classList.add("selected");
+      $("message").textContent = "Answer saved. Watch the host screen.";
+      socket.emit("answer", {
+        index: currentQuestion.index,
+        answer: selectedAnswer
+      });
+    }
+
+    function showResult(results) {
+      clearPlayerTimer();
+      if (!me || !results.question) return;
+      if (!currentQuestion && selectedAnswer === null) {
+        showWait("You are in. The next round will start soon.");
+        return;
+      }
+
+      const correctLetter = letters[results.correctAnswer];
+      const correctText = results.question.options[results.correctAnswer];
+      const answered = selectedAnswer !== null;
+      const correct = selectedAnswer === results.correctAnswer;
+
+      $("playerPhase").textContent = "Result";
+      $("resultTitle").textContent = answered
+        ? (correct ? "Correct answer" : "Answer recorded")
+        : "Time is up";
+      $("resultText").textContent = answered
+        ? `Correct answer: ${correctLetter}. ${correctText}`
+        : `You missed this one. Correct answer: ${correctLetter}. ${correctText}`;
+
+      updatePlayerBadge();
+      panel("resultPanel");
+    }
+
+    function showDone(payload) {
+      clearPlayerTimer();
+      syncMeFromLeaderboard(payload.leaderboard);
+      $("playerPhase").textContent = "Finished";
+      updatePlayerBadge();
+      panel("donePanel");
+    }
+
+    function startPlayerTimer(durationMs) {
+      const endsAt = Date.now() + durationMs;
+      const paint = () => {
+        const seconds = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+        $("playerTimer").textContent = seconds;
+        if (seconds <= 0) {
+          clearPlayerTimer();
+          document.querySelectorAll(".choice").forEach(choice => choice.disabled = true);
+          if (selectedAnswer === null) $("message").textContent = "Time is up. Watch the host screen.";
+        }
+      };
+
+      paint();
+      playerTimer = setInterval(paint, 250);
+    }
+
+    function clearPlayerTimer() {
+      if (playerTimer) clearInterval(playerTimer);
+      playerTimer = null;
+    }
+
+    $("joinBtn").onclick = () => {
+      const name = $("name").value.trim();
+      if (!name) {
+        $("err").textContent = "Please enter your name.";
+        return;
+      }
+
+      $("err").textContent = "";
+      socket.emit("join", { name });
+    };
+
+    $("name").addEventListener("keydown", event => {
+      if (event.key === "Enter") $("joinBtn").click();
+    });
+
+    socket.on("join:error", message => {
+      $("err").textContent = message;
+    });
+
+    socket.on("joined", payload => {
+      me = payload.participant;
+      updatePlayerBadge();
+
+      if (payload.phase === "lobby") showWait("You are in. Wait for the host to start.");
+      if (payload.phase === "results") showWait("You are in. The next round will start soon.");
+      if (payload.phase === "finished") showDone({ leaderboard: [] });
+    });
+
+    socket.on("status", payload => {
+      syncMeFromLeaderboard(payload.leaderboard);
+      if (!me) return;
+
+      if (payload.phase === "lobby") showWait("You are in. Wait for the host to start.");
+      if (payload.phase === "finished") showDone({ leaderboard: payload.leaderboard });
+    });
+
+    socket.on("countdown", payload => {
+      if (me) showCountdown(payload);
+    });
+    socket.on("question", payload => {
+      if (me) showQuestion(payload);
+    });
+    socket.on("answer:received", payload => {
+      me = payload.participant;
+      updatePlayerBadge();
+    });
+    socket.on("results", payload => {
+      if (me) showResult(payload);
+    });
+    socket.on("finished", payload => {
+      if (me) showDone(payload);
+    });
+    socket.on("reset", () => {
+      me = null;
+      clearPlayerTimer();
+      $("playerPhase").textContent = "Join";
+      $("name").value = "";
+      $("err").textContent = "";
+      panel("joinPanel");
+    });
+  </script>
+</body>
+</html>

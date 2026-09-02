@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ATC Quiz - Host</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body class="host-page">
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <img src="/atc-logo.jpg.jpeg" alt="Advanced Tech Club">
+        <div>
+          <span>Advanced Tech Club</span>
+          <small>Code in Air Quiz</small>
+        </div>
+      </div>
+      <div class="status-chip" id="phaseLabel">Lobby</div>
+    </header>
+
+    <main class="host-grid">
+      <section class="panel stage-panel">
+        <div class="stage-meta">
+          <span id="questionLabel">Question 0 of 10</span>
+          <span id="answerLabel">0 joined</span>
+        </div>
+        <h1 id="stageTitle">Host the quiz from here</h1>
+        <p id="stageText">Keep this screen projected. Participants scan the QR code, enter their name, then wait until you start the countdown.</p>
+
+        <div class="progress">
+          <div id="quizProgress"></div>
+        </div>
+
+        <div class="countdown-panel is-hidden" id="countdownPanel">
+          <div class="countdown-number" id="countdownNumber">5</div>
+          <div class="countdown-caption" id="countdownCaption">Question starting</div>
+        </div>
+
+        <div class="question-panel is-hidden" id="questionPanel">
+          <div class="question-header">
+            <h2 id="questionText"></h2>
+            <div class="timer" id="hostTimer">15</div>
+          </div>
+          <div class="option-grid" id="hostOptions"></div>
+        </div>
+
+        <div class="result-panel is-hidden" id="resultPanel">
+          <div class="result-summary">
+            <div>
+              <span class="eyebrow">Result</span>
+              <h2 id="resultTitle">Question result</h2>
+            </div>
+            <strong id="resultScore">0 / 0 correct</strong>
+          </div>
+          <div id="answerBreakdown" class="answer-breakdown"></div>
+        </div>
+
+        <div class="actions">
+          <button class="btn" id="start">Start Quiz</button>
+          <button class="btn secondary" id="lock">Close Question</button>
+          <button class="btn secondary" id="next">Next Question</button>
+          <button class="btn ghost" id="reset">Reset Session</button>
+        </div>
+      </section>
+
+      <aside class="panel qr-panel">
+        <span class="eyebrow">Scan to join</span>
+        <img id="qr" class="qr" alt="Quiz QR code">
+        <div class="join-url" id="joinUrl"></div>
+        <div class="qr-stats">
+          <div>
+            <strong id="participantCount">0</strong>
+            <span>players</span>
+          </div>
+          <div>
+            <strong id="quizId">ATC2026</strong>
+            <span>quiz code</span>
+          </div>
+        </div>
+        <div class="roster" id="roster"></div>
+      </aside>
+    </main>
+
+    <section class="leaderboard-board">
+      <div class="leaderboard-head">
+        <div>
+          <span class="eyebrow">Live points</span>
+          <h2>Leaderboard</h2>
+        </div>
+        <span id="leaderboardNote">Waiting for participants</span>
+      </div>
+      <div id="leaders" class="leader-bars"></div>
+    </section>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+    const $ = id => document.getElementById(id);
+    const letters = ["A", "B", "C", "D"];
+    const barColors = ["#ffd400", "#52a7ff", "#ff0f7b", "#ff6f91", "#7b61ff", "#64d2ff", "#faff00", "#ff7890", "#2fd17c", "#ff9f1c"];
+    let status = { phase: "lobby", current: -1, total: 10, leaderboard: [] };
+    let activeQuestion = null;
+    let activeResults = null;
+    let hostTimer = null;
+    let finalCelebrated = false;
+
+    async function init() {
+      const info = await (await fetch("/api/info")).json();
+      $("qr").src = info.qrDataUrl;
+      $("joinUrl").textContent = info.joinUrl;
+      $("quizId").textContent = info.quizId;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, match => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }[match]));
+    }
+
+    function showOnly(view) {
+      $("countdownPanel").classList.toggle("is-hidden", view !== "countdown");
+      $("questionPanel").classList.toggle("is-hidden", view !== "question");
+      $("resultPanel").classList.toggle("is-hidden", view !== "results");
+    }
+
+    function renderStatus(nextStatus) {
+      status = nextStatus;
+      const currentNumber = status.current >= 0 ? status.current + 1 : 0;
+      const progress = status.current >= 0 ? (currentNumber / status.total) * 100 : 0;
+
+      $("phaseLabel").textContent = phaseName(status.phase);
+      $("questionLabel").textContent = `Question ${currentNumber} of ${status.total}`;
+      $("answerLabel").textContent = `${status.participants} joined`;
+      $("participantCount").textContent = status.participants;
+      $("quizProgress").style.width = `${progress}%`;
+
+      renderLeaderboard(status.leaderboard || []);
+      renderRoster(status.leaderboard || []);
+      updateButtons();
+
+      if (status.phase === "lobby") renderLobby();
+      if (status.phase === "countdown") renderCountdown(status);
+      if (status.phase === "question" && status.question && !activeQuestion) {
+        renderQuestion({ question: status.question, durationMs: status.remainingMs || 15000 });
+      }
+      if (status.phase === "results" && !activeResults) renderWaitingResults();
+      if (status.phase === "finished") renderFinished({ leaderboard: status.leaderboard || [] });
+    }
+
+    function phaseName(phase) {
+      return {
+        lobby: "Lobby",
+        countdown: "Countdown",
+        question: "Question live",
+        results: "Results",
+        finished: "Finished"
+      }[phase] || "Lobby";
+    }
+
+    function renderLobby() {
+      clearHostTimer();
+      activeQuestion = null;
+      activeResults = null;
+      finalCelebrated = false;
+      showOnly("none");
+      $("stageTitle").textContent = "Host the quiz from here";
+      $("stageText").textContent = "Keep this screen projected. Participants scan the QR code, enter their name, then wait until you start the countdown.";
+    }
+
+    function renderCountdown(data) {
+      clearHostTimer();
+      activeQuestion = null;
+      activeResults = null;
+      finalCelebrated = false;
+      const nextQuestion = data.nextQuestion ?? data.current ?? 0;
+      showOnly("countdown");
+      $("stageTitle").textContent = `Question ${nextQuestion + 1} starts in`;
+      $("stageText").textContent = "Players see the same countdown on their phones.";
+      $("countdownNumber").textContent = data.value;
+      $("countdownCaption").textContent = "Get ready";
+    }
+
+    function renderQuestion(payload) {
+      clearHostTimer();
+      activeResults = null;
+      activeQuestion = payload.question;
+      finalCelebrated = false;
+      if (!activeQuestion) return;
+
+      showOnly("question");
+      $("stageTitle").textContent = "Question is live";
+      $("stageText").textContent = "Players are answering on their phones. Results appear here when time ends.";
+      $("questionText").textContent = `Q${activeQuestion.index + 1}. ${activeQuestion.q}`;
+      $("hostOptions").innerHTML = activeQuestion.options.map((option, index) => `
+        <div class="answer-tile">
+          <span class="letter">${letters[index]}</span>
+          <span>${escapeHtml(option)}</span>
+        </div>
+      `).join("");
+
+      startHostTimer(payload.durationMs || payload.fullDurationMs || 15000);
+      updateButtons();
+    }
+
+    function renderWaitingResults() {
+      clearHostTimer();
+      showOnly("results");
+      $("stageTitle").textContent = "Results are ready";
+      $("stageText").textContent = "Use the leaderboard below to call out the top performers, then move to the next question.";
+      $("resultTitle").textContent = "Question result";
+      $("resultScore").textContent = "Waiting for result data";
+      $("answerBreakdown").innerHTML = "";
+    }
+
+    function renderResults(results) {
+      clearHostTimer();
+      activeQuestion = null;
+      activeResults = results;
+      const question = results.question;
+      if (!question) return;
+
+      const maxCount = Math.max(1, ...results.answerCounts);
+      const correctLetter = letters[results.correctAnswer];
+      const correctText = question.options[results.correctAnswer];
+
+      showOnly("results");
+      $("stageTitle").textContent = `Q${question.index + 1} result`;
+      $("stageText").textContent = `Correct answer: ${correctLetter}. ${correctText}`;
+      $("resultTitle").textContent = `Correct answer: ${correctLetter}`;
+      $("resultScore").textContent = `${results.correctCount} / ${results.totalParticipants} correct`;
+      $("answerBreakdown").innerHTML = question.options.map((option, index) => {
+        const count = results.answerCounts[index] || 0;
+        const width = Math.max(3, (count / maxCount) * 100);
+        const isCorrect = index === results.correctAnswer ? " is-correct" : "";
+
+        return `
+          <div class="result-option${isCorrect}">
+            <div class="result-option-top">
+              <span><strong>${letters[index]}</strong> ${escapeHtml(option)}</span>
+              <span>${count}</span>
+            </div>
+            <div class="mini-track"><div style="width:${width}%"></div></div>
+          </div>
+        `;
+      }).join("");
+
+      renderLeaderboard(results.leaderboard || []);
+      updateButtons();
+    }
+
+    function renderFinished(payload) {
+      clearHostTimer();
+      activeQuestion = null;
+      activeResults = null;
+      showOnly("results");
+      $("stageTitle").textContent = "Final leaderboard";
+      $("stageText").textContent = "The quiz is complete. Celebrate the top performers from the points board below.";
+      $("resultTitle").textContent = "Quiz complete";
+      $("resultScore").textContent = `${status.total} questions`;
+      $("answerBreakdown").innerHTML = "";
+      renderLeaderboard(payload.leaderboard || []);
+      updateButtons();
+      if (!finalCelebrated) {
+        finalCelebrated = true;
+        confetti();
+      }
+    }
+
+    function renderLeaderboard(list) {
+      $("leaderboardNote").textContent = list.length ? `${list.length} participant${list.length === 1 ? "" : "s"} ranked` : "Waiting for participants";
+
+      if (!list.length) {
+        $("leaders").innerHTML = `<div class="empty-state">Players appear here after they join.</div>`;
+        return;
+      }
+
+      const maxScore = Math.max(1, ...list.map(player => player.score));
+      $("leaders").innerHTML = list.map((player, index) => {
+        const rawWidth = player.score > 0 ? (player.score / maxScore) * 100 : 6;
+        const width = Math.min(100, Math.max(6, rawWidth));
+        const avatarLeft = Math.min(98, Math.max(5, width));
+        const color = barColors[index % barColors.length];
+
+        return `
+          <div class="leader-line">
+            <div class="leader-points">${player.score} p</div>
+            <div class="leader-track">
+              <div class="leader-fill" style="width:${width}%; background:${color}"></div>
+              <span class="leader-avatar" style="left:${avatarLeft}%">${player.avatar || ""}</span>
+            </div>
+            <div class="leader-name">${escapeHtml(player.name)}</div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderRoster(list) {
+      if (!list.length) {
+        $("roster").innerHTML = `<div class="roster-empty">No players yet</div>`;
+        return;
+      }
+
+      $("roster").innerHTML = list.slice(0, 12).map(player => `
+        <div class="roster-row">
+          <span>${player.avatar || ""}</span>
+          <strong>${escapeHtml(player.name)}</strong>
+          <em>${player.score} p</em>
+        </div>
+      `).join("");
+    }
+
+    function startHostTimer(durationMs) {
+      const endsAt = Date.now() + durationMs;
+      const paint = () => {
+        const seconds = Math.max(0, Math.ceil((endsAt - Date.now()) / 1000));
+        $("hostTimer").textContent = seconds;
+        if (seconds <= 0) clearHostTimer();
+      };
+
+      paint();
+      hostTimer = setInterval(paint, 250);
+    }
+
+    function clearHostTimer() {
+      if (hostTimer) clearInterval(hostTimer);
+      hostTimer = null;
+    }
+
+    function updateButtons() {
+      $("start").disabled = status.phase !== "lobby";
+      $("lock").disabled = status.phase !== "question";
+      $("next").disabled = status.phase !== "results";
+      $("next").textContent = status.current === status.total - 1 ? "Show Final Leaderboard" : "Next Question";
+    }
+
+    function confetti() {
+      for (let i = 0; i < 80; i += 1) {
+        const piece = document.createElement("i");
+        piece.className = "confetti";
+        piece.style.left = `${Math.random() * 100}vw`;
+        piece.style.background = barColors[i % barColors.length];
+        piece.style.setProperty("--x", `${Math.random() * 320 - 160}px`);
+        piece.style.animationDelay = `${Math.random() * 0.5}s`;
+        document.body.appendChild(piece);
+        setTimeout(() => piece.remove(), 2500);
+      }
+    }
+
+    $("start").onclick = () => socket.emit("admin:start");
+    $("lock").onclick = () => socket.emit("admin:lock");
+    $("next").onclick = () => socket.emit("admin:next");
+    $("reset").onclick = () => {
+      if (confirm("Reset the quiz and remove all participants?")) socket.emit("admin:reset");
+    };
+
+    socket.on("status", renderStatus);
+    socket.on("countdown", renderCountdown);
+    socket.on("question", renderQuestion);
+    socket.on("results", renderResults);
+    socket.on("finished", renderFinished);
+    socket.on("reset", renderLobby);
+
+    init();
+  </script>
+</body>
+</html>
